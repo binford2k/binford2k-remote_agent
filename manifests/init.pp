@@ -1,9 +1,9 @@
 class remote_agent {
   File {
     owner  => 'root',
-    groupt => 'root',
+    group  => 'root',
     mode   => '0755',
-    notify => Service['puppet-remote-agent'],
+    notify => Service['remote-agent'],
   }
 
   file { '/usr/local/bin/remote-agent':
@@ -19,6 +19,12 @@ class remote_agent {
     ensure => file,
     mode   => '0644',
     source => 'puppet:///modules/remote_agent/systemd/remote-agent.service',
+  }
+
+  package { 'pcp-client':
+    ensure   => present,
+    provider => 'puppet_gem',
+    before   => Service['remote-agent'],
   }
 
   service { 'remote-agent':
