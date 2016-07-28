@@ -1,0 +1,121 @@
+#! /opt/puppetlabs/puppet/bin/ruby
+require 'pcp/client'
+require 'puppet'
+
+# Start the eventmachine reactor in its own thread
+Thread.new { EM.run }
+Thread.pass until EM.reactor_running?
+
+Puppet.initialize_settings
+
+options = {
+  :debug       => false,
+  :interactive => false,
+  :timeout     => 600,
+}
+
+optparse = OptionParser.new { |opts|
+    opts.banner = "Usage : remote-puppet [-i] <host>
+
+Runs Puppet on a remote node using the remote-agent server. If you pass the
+-i flag, then you can watch the run as it proceeds.
+
+"
+    opts.on("-t TIMEOUT", "--timeout TIMEOUT", "Timeout in seconds while waiting for Puppet run to complete") do |opt|
+        options[:timeout] = opt.to_i
+    end
+
+    opts.on("-i", "--interactive", "Watch Puppet run interactively") do
+        options[:interactive] = true
+    end
+
+    opts.on("-s", "--status", "Retrieve last run status") do
+        options[:status] = true
+    end
+
+    opts.on("-d", "--debug", "Display debugging messages") do
+        options[:debug] = true
+    end
+
+    opts.separator('')
+
+    opts.on("-h", "--help", "Displays this help") do
+        puts opts
+        exit
+    end
+
+    opts.separator('')
+}
+optparse.parse!
+
+raise "Expects a single argument of the target host" unless ARGV.size == 1
+target   = ARGV.shift
+response = nil
+
+logger = Logger.new(STDOUT)
+logger.formatter = proc { |severity,datetime,progname,msg| "#{msg}\n" }
+logger.level = options[:debug] ? Logger::DEBUG : Logger::WARN
+
+client = PCP::Client.new({:server      => "wss://#{Puppet.settings['server']}:8142/pcp",
+                          :ssl_key     => Puppet.settings['hostprivkey'],
+                          :ssl_cert    => Puppet.settings['hostcert'],
+                          :ssl_ca_cert => Puppet.settings['cacert'],
+                          :loglevel    => logger.level,
+                         })
+
+done = false
+client.on_message = proc do |message|
+  data = JSON.parse(message.data)
+  response = true if message[:sender] == "pcp://#{target}/remote-agent"
+
+  case message[:message_type]
+  when 'remote-agent/output'
+    puts data['output']
+
+  when 'remote-agent/results'
+    done = true
+
+    case data['output']
+    when String
+      puts data['output']
+    else
+      puts
+      puts 'Last Puppet Agent Run Results:'
+      puts '----------------------------------------------------------'
+      data['output'].each do |key, value|
+        printf " %16s: %s\n", key, value
+      end
+      puts
+    end
+
+  end
+end
+
+client.connect
+
+if !client.associated?
+  puts "Didn't connect to broker."
+  exit 1
+end
+
+if options[:status]
+  message = PCP::Message.new({:message_type => 'remote-agent/status',
+                              :targets      => ["pcp://#{target}/remote-agent"],
+                            })
+else
+  message = PCP::Message.new({:message_type => 'remote-agent/run',
+                              :targets      => ["pcp://#{target}/remote-agent"],
+                            })
+end
+
+message.data = options.to_json
+message.expires(3)
+client.send(message)
+
+sleep 3
+raise "#{target} did not respond" if response.nil?
+
+# just hang out until the agent run finishes
+until done
+  sleep 1
+end

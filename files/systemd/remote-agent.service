@@ -1,0 +1,13 @@
+[Unit]
+Description=Puppet Remote Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/remote-agent
+Restart=on-failure
+KillSignal=SIGINT
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

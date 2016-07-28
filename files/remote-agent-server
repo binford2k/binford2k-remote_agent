@@ -1,0 +1,173 @@
+#! /opt/puppetlabs/puppet/bin/ruby
+
+require 'pty'
+require 'puppet'
+require 'pcp/client'
+require 'optparse'
+require 'io/console'
+
+# Start the eventmachine reactor in its own thread
+Thread.new { EM.run }
+Thread.pass until EM.reactor_running?
+
+Puppet.initialize_settings
+
+options = {
+  :timeout => 600,
+  :debug   => false,
+}
+
+optparse = OptionParser.new { |opts|
+    opts.banner = "Usage : remote-puppet-server [-d] [-t]
+
+Starts a PCP server, allowing authorized clients to trigger and observe Puppet
+runs from remote. Once this is running, you can trigger Puppet runs by:
+
+$ /path/to/remote-agent [-i] --host <hostname>
+
+Or by using the Puppet subcommand:
+
+$ puppet node run hostname [-i]
+
+"
+    opts.on("-t TIMEOUT", "--timeout TIMEOUT", "Timeout in seconds while waiting for Puppet run to complete") do |opt|
+        options[:timeout] = opt.to_i
+    end
+
+    opts.on("-d", "--debug", "Display debugging messages") do
+        options[:debug] = true
+    end
+
+    opts.separator('')
+
+    opts.on("-h", "--help", "Displays this help") do
+        puts opts
+        exit
+    end
+
+    opts.separator('')
+}
+optparse.parse!
+
+logger = Logger.new(STDOUT)
+logger.formatter = proc { |severity,datetime,progname,msg| "#{progname} #{msg}\n" }
+logger.level = options[:debug] ? Logger::DEBUG : Logger::WARN
+
+client = PCP::Client.new({:server      => "wss://#{Puppet.settings['server']}:8142/pcp",
+                          :ssl_key     => Puppet.settings['hostprivkey'],
+                          :ssl_cert    => Puppet.settings['hostcert'],
+                          :ssl_ca_cert => Puppet.settings['cacert'],
+                          :loglevel    => logger.level,
+                          :type        => 'remote-agent',
+                         })
+
+def last_run_report
+  result = {}
+
+  begin
+  report = YAML.load_file(Puppet.settings[:lastrunreport])
+
+  result["kind"]             = report.kind
+  result["time"]             = report.time
+  result["transaction_uuid"] = report.transaction_uuid
+  result["config_version"]   = report.configuration_version
+  result["environment"]      = report.environment
+  result["status"]           = report.status
+  rescue => e
+    logger.error e
+  end
+
+  result
+end
+
+def sendmessage(client, type, target, message)
+  target = [target] unless target.class == Array
+
+  response = PCP::Message.new({:message_type => "remote-agent/#{type}", :targets => target})
+  response.data = {:output => message}.to_json
+  response.expires(2)
+
+  client.send(response)
+end
+
+# Set up on_message handler
+client.on_message = proc do |message|
+  logger.debug "Got message: #{message[:message_type]}"
+  agent_options = JSON.parse(message.data) rescue {}
+
+  if message[:message_type] == 'remote-agent/status'
+    sendmessage(client, 'results', message[:sender], last_run_report)
+
+  elsif message[:message_type] == 'remote-agent/run'
+    command     = 'puppet agent -t'
+    expire      = Time.now + options[:timeout]
+    starting    = true
+    interactive = agent_options['interactive']
+
+    if interactive
+      logger.info "Starting an interactive Puppet run"
+    else
+      logger.info "Starting a Puppet run"
+    end
+
+    Thread.new do
+      begin
+        PTY.spawn( command ) do |stdout, stdin, pid|
+          begin
+            stdout.each do |line|
+              if interactive or starting
+                sendmessage(client, 'output', message[:sender], line)
+
+                if not interactive and line =~ /Info: Applying configuration version/
+                  starting = false
+                  sendmessage(client, 'results', message[:sender], 'Agent run successfully started.')
+                end
+
+              end
+
+              if (Time.now > expire)
+                logger.warning "Timeout exceeded"
+                sendmessage(client, 'results', message[:sender], 'Timeout exceeded. Terminating run.')
+
+                Process.kill('TERM', pid) rescue nil
+                sleep 5
+                Process.kill('KILL', pid) rescue nil
+
+                Thread.exit
+              end
+
+            end
+
+          rescue Errno::EIO
+          ensure
+            Process.wait(pid)
+          end
+        end
+
+      rescue => e
+        logger.warn "Something went south (#{e.message})"
+        logger.debug e.backtrace
+        sendmessage(client, 'results', message[:sender], "Something went south (#{e.message})")
+      end
+
+      status = $?.exitstatus
+      logger.debug "Agent run concluded with exit status (#{status})"
+      sendmessage(client, 'results', message[:sender], "Agent run concluded with exit status (#{status})")
+
+    end
+
+  end
+end
+
+# connect
+client.connect
+
+if !client.associated?
+    logger.error "Didn't connect to broker."
+    exit 1
+end
+
+# wait forever for work
+loop do
+  sleep 10
+end
